@@ -1,34 +1,39 @@
-"""Magic Transfer server.
+"""Magic Transfer server — the HAND is the ID.
 
-Both phones open the same web page and type the same 4-digit room code.
-Phone A: show a photo, hold an open palm at the camera -> photo uploads.
-Phone B: hold an open palm -> the photo appears.
+Phone A: display a photo, scan the hand -> the photo is mapped (bound) to that
+hand's geometry signature (21 MediaPipe landmarks -> normalized ratios).
+Phone B: scan the same hand -> server finds the closest matching signature
+and returns the mapped photo.
 
-The server is the invisible middleman (like WhatsApp Web) — the user never
-pairs, scans or connects anything. Photos are kept in memory per room and
-expire after 10 minutes.
+No room code, no pairing. The hand itself is the address, like a fingerprint.
+Photos live in memory and expire after 30 minutes.
 
 Run:  pip install flask
-      python server.py            (serves on http://0.0.0.0:5000)
-Then expose it with cloudflared (same pattern as Adda):
+      python server.py            (http://0.0.0.0:5000)
       cloudflared tunnel --url http://localhost:5000
 """
+import json
+import math
 import time
+import io
 
 from flask import Flask, jsonify, request, send_file, abort
-import io
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
-# room_code -> {"data": bytes, "mimetype": str, "ts": float, "name": str}
-rooms = {}
-TTL_SECONDS = 600  # photo auto-expires after 10 min
+# entries: [{"sig": [floats], "data": bytes, "mimetype": str, "name": str, "ts": float}]
+entries = []
+TTL_SECONDS = 1800       # a hand->photo binding lives 30 minutes
+MATCH_THRESHOLD = 0.55   # max signature distance that still counts as "same hand"
 
 
 def _cleanup():
     now = time.time()
-    for code in [c for c, v in rooms.items() if now - v["ts"] > TTL_SECONDS]:
-        del rooms[code]
+    entries[:] = [e for e in entries if now - e["ts"] <= TTL_SECONDS]
+
+
+def _distance(a, b):
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
 @app.get("/")
@@ -36,47 +41,64 @@ def index():
     return app.send_static_file("index.html")
 
 
-@app.post("/room/<code>/grab")
-def grab(code):
+@app.post("/bind")
+def bind():
+    """Sender: photo + hand signature -> store the mapping."""
     _cleanup()
     f = request.files.get("photo")
-    if f is None:
-        return jsonify({"ok": False, "error": "no photo"}), 400
-    rooms[code] = {
+    sig_raw = request.form.get("sig", "")
+    if f is None or not sig_raw:
+        return jsonify({"ok": False, "error": "photo aur hand signature dono chahiye"}), 400
+    try:
+        sig = [float(x) for x in json.loads(sig_raw)]
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad signature"}), 400
+    entries.append({
+        "sig": sig,
         "data": f.read(),
         "mimetype": f.mimetype or "image/jpeg",
-        "ts": time.time(),
         "name": f.filename or "photo",
-    }
-    return jsonify({"ok": True, "ts": rooms[code]["ts"]})
+        "ts": time.time(),
+    })
+    return jsonify({"ok": True, "bindings": len(entries)})
 
 
-@app.get("/room/<code>/peek")
-def peek(code):
-    """Receiver polls this: is there a photo newer than ?since=<ts>?"""
+@app.post("/lookup")
+def lookup():
+    """Receiver: hand signature -> closest binding, if close enough."""
     _cleanup()
-    since = request.args.get("since", default=0, type=float)
-    entry = rooms.get(code)
-    if entry and entry["ts"] > since:
-        return jsonify({"available": True, "ts": entry["ts"], "name": entry["name"]})
-    return jsonify({"available": False})
+    body = request.get_json(silent=True) or {}
+    sig = body.get("sig")
+    if not sig:
+        return jsonify({"found": False, "error": "no signature"}), 400
+    best, best_d = None, None
+    for i, e in enumerate(entries):
+        if len(e["sig"]) != len(sig):
+            continue
+        d = _distance(sig, e["sig"])
+        if best_d is None or d < best_d:
+            best, best_d = i, d
+    if best is not None and best_d <= MATCH_THRESHOLD:
+        return jsonify({"found": True, "id": best, "distance": round(best_d, 3),
+                        "name": entries[best]["name"]})
+    return jsonify({"found": False,
+                    "closest": round(best_d, 3) if best_d is not None else None})
 
 
-@app.get("/room/<code>/photo")
-def photo(code):
-    entry = rooms.get(code)
-    if entry is None:
+@app.get("/fetch/<int:entry_id>")
+def fetch(entry_id):
+    _cleanup()
+    if entry_id < 0 or entry_id >= len(entries):
         abort(404)
-    return send_file(
-        io.BytesIO(entry["data"]),
-        mimetype=entry["mimetype"],
-        download_name=entry["name"],
-    )
+    e = entries[entry_id]
+    return send_file(io.BytesIO(e["data"]), mimetype=e["mimetype"],
+                     download_name=e["name"])
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "rooms": len(rooms)})
+    _cleanup()
+    return jsonify({"ok": True, "bindings": len(entries)})
 
 
 if __name__ == "__main__":

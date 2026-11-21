@@ -3,20 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Magic Transfer ✨</title>
+<title>Magic Transfer ✨ — Haath hi ID hai</title>
 <style>
   * { box-sizing: border-box; margin: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0b14; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 16px; }
   h1 { font-size: 22px; margin: 8px 0 4px; }
   .sub { color: #9a9ab0; font-size: 13px; margin-bottom: 16px; text-align: center; }
   .card { background: #171726; border: 1px solid #2a2a40; border-radius: 16px; padding: 16px; width: 100%; max-width: 420px; }
-  input.code { width: 100%; font-size: 28px; text-align: center; letter-spacing: 8px; padding: 10px; border-radius: 12px; border: 1px solid #33334d; background: #0f0f1c; color: #fff; }
   .row { display: flex; gap: 10px; margin-top: 14px; }
   button { flex: 1; padding: 14px; font-size: 16px; border: 0; border-radius: 12px; background: #6c4dff; color: #fff; font-weight: 600; }
   button.ghost { background: #262640; font-weight: 400; font-size: 14px; }
   button:active { transform: scale(.98); }
   #stage { display: none; width: 100%; max-width: 420px; }
-  #photoWrap { position: relative; border-radius: 16px; overflow: hidden; background: #111; min-height: 260px; display: flex; align-items: center; justify-content: center; }
+  #photoWrap { position: relative; border-radius: 16px; overflow: hidden; background: #111; min-height: 240px; display: flex; align-items: center; justify-content: center; }
   #photo { max-width: 100%; max-height: 52vh; display: block; transition: transform .8s ease, opacity .8s ease; }
   #photo.fly { transform: scale(.05) translateY(-120px); opacity: 0; }
   #photo.arrive { animation: arrive .8s ease; }
@@ -32,15 +31,14 @@
 </head>
 <body>
 <h1>✨ Magic Transfer</h1>
-<div class="sub">Haath dikhao, photo gayab — dusre phone me haath dikhao, photo hazir.<br>Dono phone me bas <b>same 4-digit code</b> dalna hai.</div>
+<div class="sub"><b>Haath hi ID hai.</b> Bhejne wala photo par haath scan karta hai — photo us haath se map ho jati hai.<br>Dusre phone me wahi haath scan karo — wahi photo aa jayegi.</div>
 
 <div class="card" id="setup">
-  <input class="code" id="room" inputmode="numeric" maxlength="4" placeholder="1234">
-  <div class="row">
-    <button id="btnSend">📤 Bhejna hai</button>
-    <button id="btnRecv">📥 Lena hai</button>
+  <div class="row" style="margin-top:0">
+    <button id="btnSend">📤 Photo map karna hai</button>
+    <button id="btnRecv">📥 Haath se photo lena hai</button>
   </div>
-  <div class="hint">Dono phone par yahi code hona chahiye. Koi pairing nahi, koi Bluetooth nahi.</div>
+  <div class="hint">Koi code nahi, koi pairing nahi — pehchan sirf haath ki hai.</div>
 </div>
 
 <div id="stage">
@@ -56,7 +54,7 @@
   <div id="progress"><div id="progressBar"></div></div>
   <div class="row">
     <button class="ghost" id="btnPick">🖼 Photo chuno</button>
-    <button class="ghost" id="btnTap">👆 Gesture bina bhejo/lo</button>
+    <button class="ghost" id="btnAgain" style="display:none">🔁 Dobara scan</button>
   </div>
   <input type="file" id="file" accept="image/*" style="display:none">
   <div class="hint" id="modeHint"></div>
@@ -66,8 +64,8 @@
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 <script>
 const $ = id => document.getElementById(id);
-let mode = null, room = "", photoBlob = null, lastSeenTs = 0, busy = false;
-let palmSince = 0;
+let mode = null, photoBlob = null, busy = false, done = false;
+let sigBuffer = [], palmStart = 0;
 
 function setStatus(t) { $("status").textContent = t; }
 function setProgress(p) {
@@ -75,14 +73,27 @@ function setProgress(p) {
   if (p !== null) $("progressBar").style.width = (p * 100) + "%";
 }
 
-function openPalm(landmarks) {
-  // Open palm: all 4 fingertips farther from wrist than their PIP joints.
-  const wrist = landmarks[0];
-  const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-  return [8, 12, 16, 20].every((tip, i) => {
-    const pip = [6, 10, 14, 18][i];
-    return d(landmarks[tip], wrist) > d(landmarks[pip], wrist) * 1.25;
-  });
+// ---- Hand signature: 21 landmarks -> size/position-independent ratios ----
+function signature(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y, (lm[a].z || 0) - (lm[b].z || 0));
+  const scale = d(0, 9) || 1; // wrist -> middle-finger base = palm size
+  const seg = (a, b) => d(a, b) / scale;
+  const feats = [];
+  const chains = [[0,1,2,3,4],[0,5,6,7,8],[9,10,11,12],[0,13,14,15,16],[0,17,18,19,20]];
+  chains.forEach(ch => { for (let i = 0; i + 1 < ch.length; i++) feats.push(seg(ch[i], ch[i+1])); });
+  [4, 8, 12, 16, 20].forEach(tip => feats.push(seg(0, tip))); // fingertip reach
+  return feats; // 24 numbers — this hand's "ID"
+}
+
+function openPalm(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+  return [8, 12, 16, 20].every((tip, i) => d(tip, 0) > d([6,10,14,18][i], 0) * 1.25);
+}
+
+function averageSig(buf) {
+  const out = new Array(buf[0].length).fill(0);
+  buf.forEach(s => s.forEach((v, i) => out[i] += v / buf.length));
+  return out;
 }
 
 async function startCamera() {
@@ -90,72 +101,74 @@ async function startCamera() {
   const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
   hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
   hands.onResults(res => {
+    if (busy || done) return;
     const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
     const palm = !!lm && openPalm(lm);
-    $("palmBadge").textContent = palm ? "✋ Haath dikh raha hai…" : "✋ Haath camera ke saamne karo";
-    if (palm && !busy) {
-      if (!palmSince) palmSince = Date.now();
-      setProgress(Math.min((Date.now() - palmSince) / 800, 1));
-      if (Date.now() - palmSince >= 800) { palmSince = 0; setProgress(null); onGesture(); }
-    } else { palmSince = 0; if (!busy) setProgress(null); }
+    $("palmBadge").textContent = palm ? "✋ Haath scan ho raha hai…" : "✋ Khula haath camera ke saamne rakho";
+    if (palm) {
+      if (!palmStart) { palmStart = Date.now(); sigBuffer = []; }
+      sigBuffer.push(signature(lm));
+      const held = Date.now() - palmStart;
+      setProgress(Math.min(held / 900, 1));
+      if (held >= 900 && sigBuffer.length >= 8) {
+        const sig = averageSig(sigBuffer);
+        palmStart = 0; sigBuffer = []; setProgress(null);
+        onHandScanned(sig);
+      }
+    } else { palmStart = 0; sigBuffer = []; setProgress(null); }
   });
   const cam = new Camera(video, { onFrame: async () => { await hands.send({ image: video }); }, width: 640, height: 480 });
   cam.start();
 }
 
-async function onGesture() {
-  if (mode === "send") await doSend();
-  else if (mode === "recv") await doReceive(true);
-}
-
-async function doSend() {
-  if (!photoBlob) { setStatus("Pehle photo chuno 🖼"); return; }
-  busy = true; setStatus("✨ Bhej raha hu…");
-  const fd = new FormData();
-  fd.append("photo", photoBlob, "photo.jpg");
-  try {
-    const r = await fetch(`/room/${room}/grab`, { method: "POST", body: fd });
-    const j = await r.json();
-    if (j.ok) {
-      $("photo").classList.add("fly");
-      setStatus("🎩 Gayab! Ab dusre phone me haath dikhao, photo wahi aayega.");
-    } else setStatus("❌ Nahi gaya, dobara try karo");
-  } catch (e) { setStatus("❌ Server se connect nahi ho raha"); }
-  busy = false;
-}
-
-async function doReceive(fromGesture) {
-  if (busy) return;
-  busy = true; setStatus("🔍 Photo dhoondh raha hu…");
-  try {
-    const r = await fetch(`/room/${room}/peek?since=${lastSeenTs}`);
-    const j = await r.json();
-    if (j.available) {
-      const img = await (await fetch(`/room/${room}/photo`)).blob();
-      lastSeenTs = j.ts;
-      $("photo").src = URL.createObjectURL(img);
-      $("photo").style.display = "block";
-      $("placeholder").style.display = "none";
-      $("photo").classList.remove("arrive"); void $("photo").offsetWidth;
-      $("photo").classList.add("arrive");
-      setStatus("✨ Photo aa gaya!");
-    } else setStatus(fromGesture ? "Abhi koi naya photo nahi hai — pehle dusre phone se bhejo" : "Wait ho raha hai…");
-  } catch (e) { setStatus("❌ Server se connect nahi ho raha"); }
-  busy = false;
+async function onHandScanned(sig) {
+  if (mode === "send") {
+    if (!photoBlob) { setStatus("Pehle photo chuno 🖼 — phir haath scan karo"); return; }
+    busy = true; setStatus("🔗 Photo ko is haath se map kar raha hu…");
+    const fd = new FormData();
+    fd.append("photo", photoBlob, "photo.jpg");
+    fd.append("sig", JSON.stringify(sig));
+    try {
+      const j = await (await fetch("/bind", { method: "POST", body: fd })).json();
+      if (j.ok) {
+        done = true; $("btnAgain").style.display = "block";
+        $("photo").classList.add("fly");
+        setStatus("🎩 Ho gaya! Photo is haath se map hai. Ab dusre phone me yahi haath scan karo.");
+      } else setStatus("❌ Map nahi hua: " + (j.error || ""));
+    } catch (e) { setStatus("❌ Server se connect nahi ho raha"); }
+    busy = false;
+  } else {
+    busy = true; setStatus("🔍 Is haath se mapped photo dhoondh raha hu…");
+    try {
+      const j = await (await fetch("/lookup", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sig })
+      })).json();
+      if (j.found) {
+        const blob = await (await fetch(`/fetch/${j.id}`)).blob();
+        $("photo").src = URL.createObjectURL(blob);
+        $("photo").style.display = "block";
+        $("placeholder").style.display = "none";
+        $("photo").classList.remove("arrive"); void $("photo").offsetWidth;
+        $("photo").classList.add("arrive");
+        done = true; $("btnAgain").style.display = "block";
+        setStatus("✨ Mil gaya! Ye photo isiliye aayi kyunki haath match ho gaya.");
+      } else setStatus("🤔 Is haath se koi photo mapped nahi mili — wahi haath, waise hi khula rakho jaisa bhejte time rakha tha");
+    } catch (e) { setStatus("❌ Server se connect nahi ho raha"); }
+    busy = false;
+  }
 }
 
 function enter(m) {
-  room = $("room").value.trim();
-  if (room.length !== 4) { alert("4-digit code dalo (dono phone me same)"); return; }
   mode = m;
   $("setup").style.display = "none";
   $("stage").style.display = "block";
+  $("btnPick").style.display = m === "send" ? "block" : "none";
   $("modeHint").textContent = m === "send"
-    ? "Photo chuno → photo ke saamne ✋ haath 1 second rakho → photo gayab."
-    : "✋ haath 1 second rakho → dusre phone se bheja photo yaha aa jayega.";
-  setStatus(m === "send" ? "Photo chuno aur haath dikhao" : "Wait ho raha hai… haath dikhao");
+    ? "1) Photo chuno  2) Khula haath 1 second scan karo — photo haath se map ho jayegi."
+    : "Khula haath 1 second scan karo — jis photo se ye haath mapped hai, wahi yaha aayegi.";
+  setStatus(m === "send" ? "Photo chuno, phir haath scan karo" : "Haath scan karo");
   startCamera();
-  if (m === "recv") setInterval(() => { if (!busy) doReceive(false); }, 2500);
 }
 
 $("btnSend").onclick = () => enter("send");
@@ -169,9 +182,9 @@ $("file").onchange = e => {
   $("photo").style.display = "block";
   $("photo").classList.remove("fly");
   $("placeholder").style.display = "none";
-  setStatus("Photo ready hai — ab ✋ haath dikhao");
+  setStatus("Photo ready — ab khula haath scan karo ✋");
 };
-$("btnTap").onclick = () => { mode === "send" ? doSend() : doReceive(true); };
+$("btnAgain").onclick = () => { done = false; $("btnAgain").style.display = "none"; $("photo").classList.remove("fly"); setStatus("Dobara haath scan karo ✋"); };
 </script>
 </body>
 </html>
