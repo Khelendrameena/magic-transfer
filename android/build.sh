@@ -14,7 +14,8 @@ SRC=app/src/main
 
 aapt2 compile --dir $SRC/res -o build/compiled.zip
 aapt2 link -o build/unsigned.apk -I "$AJAR" --manifest $SRC/AndroidManifest.xml \
-  -R build/compiled.zip --java build/gen --auto-add-overlay
+  -R build/compiled.zip --java build/gen --auto-add-overlay \
+  --min-sdk-version 24 --target-sdk-version 33 --version-code 3 --version-name "3.0"
 
 javac -encoding UTF-8 -source 8 -target 8 -cp "$AJAR" -d build/classes \
   $(find build/gen -name '*.java') $SRC/java/com/khelendra/magictransfer/MainActivity.java
