@@ -20,7 +20,8 @@ javac -encoding UTF-8 -source 8 -target 8 -cp "$AJAR" -d build/classes \
   $(find build/gen -name '*.java') $SRC/java/com/khelendra/magictransfer/MainActivity.java
 
 d8 --lib "$AJAR" --output build/dex $(find build/classes -name '*.class')
-cd build && zip -q unsigned.apk dex/classes.dex && cd ..
+# classes.dex MUST sit at the APK root, not under dex/
+(cd build/dex && zip -q ../unsigned.apk classes.dex)
 zipalign -f 4 build/unsigned.apk build/aligned.apk
 apksigner sign --ks "$KS" --ks-pass pass:android --out MagicTransfer.apk build/aligned.apk
 apksigner verify MagicTransfer.apk
