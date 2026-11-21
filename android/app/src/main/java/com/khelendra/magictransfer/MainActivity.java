@@ -371,7 +371,12 @@ public class MainActivity extends Activity implements SensorEventListener {
     private void setupP2p() {
         p2p = (WifiP2pManager) getSystemService(Context.WIFI_P2P_SERVICE);
         if (p2p == null) { setStatus("Is phone me Wi-Fi Direct nahi hai"); return; }
-        channel = p2p.initialize(this, getMainLooper(), null);
+        channel = p2p.initialize(this, getMainLooper(), () -> {
+            // Channel toot jaye to khud dobara banao aur search phir chalao
+            log("channel toota — dobara bana raha hu");
+            channel = p2p.initialize(this, getMainLooper(), null);
+            ui.postDelayed(this::startDiscovery, 1500);
+        });
         receiver = new BroadcastReceiver() {
             @Override public void onReceive(Context ctx, Intent intent) {
                 String action = intent.getAction();
@@ -399,8 +404,28 @@ public class MainActivity extends Activity implements SensorEventListener {
         ui.postDelayed(this::retryDiscoveryLoop, 20000);
     }
 
+    private boolean environmentOk() {
+        android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wm == null || !wm.isWifiEnabled()) {
+            setStatus("❌ Wi-Fi BAND hai — pehle dono phone me Wi-Fi ON karo");
+            log("Wi-Fi band hai ❌");
+            return false;
+        }
+        if (Build.VERSION.SDK_INT < 33) {
+            int mode = 0;
+            try { mode = android.provider.Settings.Secure.getInt(getContentResolver(), android.provider.Settings.Secure.LOCATION_MODE); } catch (Exception ignored) { }
+            if (mode == 0) {
+                setStatus("❌ Location BAND hai — Wi-Fi Direct ke liye dono phone me Location ON karna padta hai (Android ka rule hai)");
+                log("Location band hai ❌");
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void startDiscovery() {
         if (p2p == null || channel == null) return;
+        if (!environmentOk()) return;
         try {
             // Apne aap ko advertise karo taaki dusra Magic Transfer mujhe pehchan sake (sirf ek baar)
             if (!serviceRegistered) {
@@ -510,6 +535,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     // ---------------- Lifecycle ----------------
     @Override protected void onResume() {
         super.onResume();
+        if (!connected && !connecting) startDiscovery();
         IntentFilter f = new IntentFilter();
         f.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
         f.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
