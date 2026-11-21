@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Magic Transfer ✨</title>
+<style>
+  * { box-sizing: border-box; margin: 0; font-family: system-ui, sans-serif; }
+  body { background: #0b0b14; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 16px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  .sub { color: #9a9ab0; font-size: 13px; margin-bottom: 14px; text-align: center; }
+  .card { background: #171726; border: 1px solid #2a2a40; border-radius: 16px; padding: 16px; width: 100%; max-width: 420px; }
+  .row { display: flex; gap: 10px; margin-top: 12px; }
+  button { flex: 1; padding: 14px; font-size: 16px; border: 0; border-radius: 12px; background: #6c4dff; color: #fff; font-weight: 600; }
+  button.ghost { background: #262640; font-weight: 400; font-size: 14px; }
+  button:active { transform: scale(.98); }
+  section { display: none; width: 100%; max-width: 420px; }
+  section.on { display: block; }
+  #photo { max-width: 100%; max-height: 46vh; display: block; margin: 0 auto; border-radius: 12px; }
+  #photo.arrive { animation: arrive .8s ease; }
+  @keyframes arrive { from { transform: scale(1.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  .camBox { position: relative; margin-top: 12px; border-radius: 16px; overflow: hidden; background:#000; }
+  video { width: 100%; display: block; transform: scaleX(-1); }
+  #palmBadge { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,.65); padding: 6px 10px; border-radius: 999px; font-size: 13px; }
+  #status { margin-top: 12px; text-align: center; font-size: 15px; min-height: 22px; }
+  #progress { height: 8px; background: #262640; border-radius: 99px; margin-top: 8px; overflow: hidden; display: none; }
+  #progressBar { height: 100%; width: 0%; background: #6c4dff; transition: width .15s; }
+  #qrCanvas { background: #fff; border-radius: 12px; display: block; margin: 10px auto; }
+  .hint { color: #9a9ab0; font-size: 13px; text-align: center; margin-top: 10px; }
+  .frameInfo { text-align:center; color:#ffd54d; font-size:14px; margin-top:6px; }
+</style>
+</head>
+<body>
+<h1>✨ Magic Transfer</h1>
+<div class="sub">Na Wi-Fi, na Bluetooth, na server — photo <b>screen se camera</b> me jati hai (animated QR),<br>aur khulti sirf <b>usi haath</b> se hai jis se bheji gayi thi.</div>
+
+<div class="card" id="home">
+  <div class="row" style="margin-top:0">
+    <button id="btnSend">📤 Photo bhejo</button>
+    <button id="btnRecv">📥 Photo lo</button>
+  </div>
+  <div class="hint">Bhejne wala photo + haath scan karega. Lene wala pehle QR scan karega, phir wahi haath dikhayega — photo tabhi khulegi.</div>
+</div>
+
+<section id="stage">
+  <div id="photoWrap"><img id="photo" style="display:none"></div>
+  <div class="camBox" id="camBox" style="display:none">
+    <video id="cam" playsinline muted></video>
+    <div id="palmBadge">✋</div>
+  </div>
+  <canvas id="qrCanvas" width="330" height="330" style="display:none"></canvas>
+  <div class="frameInfo" id="frameInfo"></div>
+  <div id="status">Taiyaar</div>
+  <div id="progress"><div id="progressBar"></div></div>
+  <div class="row">
+    <button class="ghost" id="btnPick">🖼 Photo chuno</button>
+    <button class="ghost" id="btnStop" style="display:none">⏹ Band karo</button>
+  </div>
+  <input type="file" id="file" accept="image/*" style="display:none">
+  <div class="hint" id="modeHint"></div>
+</section>
+
+<script src="mp/camera_utils.js"></script>
+<script src="mp/hands.js"></script>
+<script src="mp/qrcode.js"></script>
+<script src="mp/zxing-browser.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const CHUNK = 900;               // base64 chars per QR frame
+const THRESHOLD = 0.55;          // hand-pattern match distance
+let mode = null;                 // 'send' | 'recv'
+let photoB64 = "";               // sender: base64 of compressed photo
+let frames = [], frameTimer = null;
+let recv = null;                 // receiver state {total, chunks:Map, sig}
+let zxingControls = null, mpCamera = null;
+let sigBuffer = [], palmStart = 0, handBusy = false;
+
+function setStatus(t) { $("status").textContent = t; }
+function setProgress(p) {
+  $("progress").style.display = p === null ? "none" : "block";
+  if (p !== null) $("progressBar").style.width = Math.round(p * 100) + "%";
+}
+function showCam(on) { $("camBox").style.display = on ? "block" : "none"; }
+
+async function stopCamera() {
+  try { if (zxingControls) { zxingControls.stop(); zxingControls = null; } } catch (e) {}
+  try { if (mpCamera) { mpCamera.stop(); mpCamera = null; } } catch (e) {}
+  const v = $("cam");
+  if (v.srcObject) { v.srcObject.getTracks().forEach(t => t.stop()); v.srcObject = null; }
+}
+
+// ---------- Hand pattern (MediaPipe CNN -> 21 points -> ratios) ----------
+function signature(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y, (lm[a].z || 0) - (lm[b].z || 0));
+  const scale = d(0, 9) || 1;
+  const seg = (a, b) => d(a, b) / scale;
+  const feats = [];
+  const chains = [[0,1,2,3,4],[0,5,6,7,8],[9,10,11,12],[0,13,14,15,16],[0,17,18,19,20]];
+  chains.forEach(ch => { for (let i = 0; i + 1 < ch.length; i++) feats.push(seg(ch[i], ch[i+1])); });
+  [4, 8, 12, 16, 20].forEach(tip => feats.push(seg(0, tip)));
+  return feats;
+}
+function openPalm(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+  return [8, 12, 16, 20].every((tip, i) => d(tip, 0) > d([6,10,14,18][i], 0) * 1.25);
+}
+function dist(a, b) { return Math.sqrt(a.reduce((s, v, i) => s + (v - b[i]) * (v - b[i]), 0)); }
+function avgSig(buf) { const o = new Array(buf[0].length).fill(0); buf.forEach(s => s.forEach((v, i) => o[i] += v / buf.length)); return o; }
+
+function scanHand(onDone) {
+  handBusy = false; sigBuffer = []; palmStart = 0;
+  showCam(true);
+  setStatus("✋ Khula haath camera ke saamne 1 second rakho…");
+  const video = $("cam");
+  const hands = new Hands({ locateFile: f => `mp/${f}` });
+  hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+  hands.onResults(res => {
+    if (handBusy) return;
+    const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
+    const palm = !!lm && openPalm(lm);
+    $("palmBadge").textContent = palm ? "✋ Scan ho raha hai…" : "✋ Khula haath dikhao";
+    if (palm) {
+      if (!palmStart) { palmStart = Date.now(); sigBuffer = []; }
+      sigBuffer.push(signature(lm));
+      const held = Date.now() - palmStart;
+      setProgress(Math.min(held / 900, 1));
+      if (held >= 900 && sigBuffer.length >= 8) {
+        handBusy = true; setProgress(null);
+        const sig = avgSig(sigBuffer);
+        stopCamera().then(() => { showCam(false); onDone(sig); });
+      }
+    } else { palmStart = 0; sigBuffer = []; setProgress(null); }
+  });
+  mpCamera = new Camera(video, { onFrame: async () => { await hands.send({ image: video }); }, width: 640, height: 480 });
+  mpCamera.start();
+}
+
+// ---------- Photo compress ----------
+function compressPhoto(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const maxSide = 1024;
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      let q = 0.82, url = c.toDataURL("image/jpeg", q);
+      while (url.length > 150000 && q > 0.3) { q -= 0.12; url = c.toDataURL("image/jpeg", q); }
+      resolve(url.split(",")[1]);
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// ---------- SEND: QR fountain ----------
+function drawQR(text) {
+  const qr = qrcode(0, "M");
+  qr.addData(text, "Byte");
+  qr.make();
+  const cv = $("qrCanvas"), ctx = cv.getContext("2d");
+  const n = qr.getModuleCount(), cell = Math.max(2, Math.floor(320 / (n + 2))), size = cell * (n + 2);
+  cv.width = size; cv.height = size;
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = "#000";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
+    if (qr.isDark(r, c)) ctx.fillRect((c + 1) * cell, (r + 1) * cell, cell, cell);
+}
+function startQRLoop() {
+  $("qrCanvas").style.display = "block";
+  $("btnStop").style.display = "block";
+  let tick = 0;
+  frameTimer = setInterval(() => {
+    let idx;
+    if (tick % (frames.length + 3) < 3) idx = 0; else idx = 1 + ((tick - 3) % (frames.length - 1));
+    drawQR(frames[idx]);
+    $("frameInfo").textContent = idx === 0 ? "Pehchan wala frame (header)" : `Frame ${idx} / ${frames.length - 1}`;
+    tick++;
+  }, 150);
+  setStatus("📡 QR chalu hai — dusre phone par 'Photo lo' kholo aur camera is screen par rakho. Jab waha 100% ho jaye, yaha Band karo dabao.");
+}
+function stopQRLoop() {
+  if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
+  $("qrCanvas").style.display = "none"; $("frameInfo").textContent = "";
+  $("btnStop").style.display = "none";
+}
+
+function startSend() {
+  if (!photoB64) { setStatus("Pehle photo chuno 🖼"); return; }
+  scanHand(sig => {
+    const chunks = [];
+    for (let i = 0; i < photoB64.length; i += CHUNK) chunks.push(photoB64.substring(i, i + CHUNK));
+    const header = { n: chunks.length, sig: sig.map(v => Math.round(v * 100) / 100) };
+    frames = ["MT1|H|" + JSON.stringify(header)].concat(chunks.map((c, i) => `MT1|${i}|${c}`));
+    setStatus(`Photo taiyaar: ${chunks.length} frame. QR shuru…`);
+    startQRLoop();
+  });
+}
+
+// ---------- RECEIVE: QR scan -> hand unlock ----------
+async function startReceive() {
+  recv = { total: 0, chunks: new Map(), sig: null };
+  showCam(true);
+  setStatus("📷 Bhejne wale phone ki screen par camera rakho…");
+  setProgress(0);
+  const reader = new ZXingBrowser.BrowserQRCodeReader();
+  try {
+    zxingControls = await reader.decodeFromVideoDevice(null, $("cam"), (result) => {
+      if (!result || !recv) return;
+      const text = result.getText();
+      if (!text.startsWith("MT1|")) return;
+      const parts = text.split("|");
+      if (parts[1] === "H") {
+        try {
+          const h = JSON.parse(parts.slice(2).join("|"));
+          if (!recv.total) { recv.total = h.n; recv.sig = h.sig; setStatus(`Pehchan mil gayi — kul ${h.n} frame. Scan jaari rakho…`); }
+        } catch (e) {}
+        return;
+      }
+      const idx = parseInt(parts[1], 10);
+      if (isNaN(idx) || recv.chunks.has(idx)) return;
+      recv.chunks.set(idx, parts.slice(2).join("|"));
+      if (recv.total) {
+        setProgress(recv.chunks.size / recv.total);
+        setStatus(`Mil rahe hain… ${recv.chunks.size}/${recv.total}`);
+        if (recv.chunks.size >= recv.total) finishReceive();
+      }
+    });
+  } catch (e) { setStatus("❌ Camera khul nahi paya: " + e.message); }
+}
+async function finishReceive() {
+  const state = recv; recv = null;
+  await stopCamera(); showCam(false); setProgress(null);
+  let b64 = "";
+  for (let i = 0; i < state.total; i++) b64 += state.chunks.get(i) || "";
+  if (state.chunks.size < state.total) { setStatus("Kuch frame reh gaye — dobara try karo"); return; }
+  setStatus("✅ Photo poori mil gayi! Ab wahi haath scan karo jis se bheji gayi thi…");
+  scanHand(sig => {
+    const d = dist(sig, state.sig);
+    if (d <= THRESHOLD) {
+      const img = $("photo");
+      img.src = "data:image/jpeg;base64," + b64;
+      img.style.display = "block";
+      img.classList.remove("arrive"); void img.offsetWidth; img.classList.add("arrive");
+      setStatus("🎩 Haath match! Photo hazir. Gallery me save kar raha hu…");
+      try { window.AndroidSave.saveImage(b64); } catch (e) {}
+    } else {
+      setStatus("🚫 Ye haath match nahi hua — photo usi haath se khulegi jis se bheji gayi thi. Dobara ke liye 'Photo lo' phir se dabao.");
+    }
+  });
+}
+
+// ---------- Wiring ----------
+function enter(m) {
+  mode = m;
+  $("home").style.display = "none";
+  $("stage").classList.add("on");
+  $("btnPick").style.display = m === "send" ? "block" : "none";
+  $("modeHint").textContent = m === "send"
+    ? "Photo chuno → haath scan karo → QR chalega. Photo phone me hi rehti hai, kahin upload nahi hoti."
+    : "Camera bhejne wale ki screen par rakho → 100% hote hi haath scan → photo khulegi aur gallery me save ho jayegi.";
+  if (m === "recv") startReceive();
+  else setStatus("Photo chuno, phir haath scan hoga");
+}
+$("btnSend").onclick = () => enter("send");
+$("btnRecv").onclick = () => enter("recv");
+$("btnPick").onclick = () => $("file").click();
+$("file").onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  setStatus("Photo taiyaar kar raha hu (chhota size, taaki QR tez chale)…");
+  photoB64 = await compressPhoto(f);
+  const img = $("photo");
+  img.src = "data:image/jpeg;base64," + photoB64;
+  img.style.display = "block";
+  setStatus(`Photo ready (~${Math.round(photoB64.length * 0.75 / 1024)} KB). Ab haath scan karke bhejo:`);
+  if (!$("btnGo")) {
+    const b = document.createElement("button");
+    b.id = "btnGo";
+    b.textContent = "✋ Haath scan karke bhejo";
+    b.onclick = startSend;
+    b.style.cssText = "margin-top:10px;width:100%;padding:14px;background:#6c4dff;color:#fff;border:0;border-radius:12px;font-size:16px;font-weight:600";
+    $("stage").appendChild(b);
+  }
+};
+$("btnStop").onclick = () => { stopQRLoop(); setStatus("Band kar diya."); };
+</script>
+</body>
+</html>
