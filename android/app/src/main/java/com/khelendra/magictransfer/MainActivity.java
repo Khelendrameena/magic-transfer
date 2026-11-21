@@ -68,6 +68,10 @@ public class MainActivity extends Activity implements SensorEventListener {
     private static final String SERVICE_TYPE = "_presence._tcp";
 
     private TextView status;
+    private TextView logView;
+    private final java.util.List<String> logLines = new ArrayList<>();
+    private boolean serviceRegistered = false;
+    private boolean serviceRequestAdded = false;
     private GridView grid;
     private FrameLayout overlay;
     private ImageView overlayImg;
@@ -132,6 +136,17 @@ public class MainActivity extends Activity implements SensorEventListener {
         status.setPadding(32, 0, 32, 16);
         col.addView(status);
 
+        logView = new TextView(this);
+        logView.setTextColor(Color.parseColor("#5f5f7a"));
+        logView.setTextSize(11);
+        logView.setPadding(32, 0, 32, 8);
+        col.addView(logView);
+
+        android.widget.Button retry = new android.widget.Button(this);
+        retry.setText("🔍 Dobara dhoondo");
+        retry.setOnClickListener(v -> { log("haath se dobara search"); startDiscovery(); });
+        col.addView(retry);
+
         grid = new GridView(this);
         grid.setNumColumns(3);
         grid.setHorizontalSpacing(6);
@@ -170,6 +185,24 @@ public class MainActivity extends Activity implements SensorEventListener {
     }
 
     private void setStatus(String s) { ui.post(() -> status.setText(s)); }
+
+    private void log(String s) {
+        ui.post(() -> {
+            logLines.add(0, "• " + s);
+            while (logLines.size() > 5) logLines.remove(logLines.size() - 1);
+            logView.setText(android.text.TextUtils.join("\n", logLines));
+        });
+    }
+
+    private static String reasonText(int r) {
+        switch (r) {
+            case 0: return "ERROR";
+            case 1: return "P2P_UNSUPPORTED";
+            case 2: return "BUSY (thodi der me dobara try hoga)";
+            case 3: return "NO_SERVICE_REQUESTS";
+            default: return "code " + r;
+        }
+    }
 
     // ---------------- Permissions ----------------
     private void requestNeededPermissions() {
@@ -369,46 +402,63 @@ public class MainActivity extends Activity implements SensorEventListener {
     private void startDiscovery() {
         if (p2p == null || channel == null) return;
         try {
-            // Apne aap ko advertise karo taaki dusra Magic Transfer mujhe pehchan sake
-            Map<String, String> record = new HashMap<>();
-            record.put("app", "magictransfer");
-            WifiP2pDnsSdServiceInfo service = WifiP2pDnsSdServiceInfo.newInstance(SERVICE_INSTANCE, SERVICE_TYPE, record);
-            p2p.addLocalService(channel, service, null);
+            // Apne aap ko advertise karo taaki dusra Magic Transfer mujhe pehchan sake (sirf ek baar)
+            if (!serviceRegistered) {
+                Map<String, String> record = new HashMap<>();
+                record.put("app", "magictransfer");
+                WifiP2pDnsSdServiceInfo service = WifiP2pDnsSdServiceInfo.newInstance(SERVICE_INSTANCE, SERVICE_TYPE, record);
+                p2p.addLocalService(channel, service, new WifiP2pManager.ActionListener() {
+                    @Override public void onSuccess() { serviceRegistered = true; log("apna naam advertise ho gaya ✓"); }
+                    @Override public void onFailure(int r) { log("advertise fail: " + reasonText(r)); }
+                });
+            }
             p2p.setDnsSdResponseListeners(channel, (instance, type, device) -> {
+                log("service mila: " + instance + " (" + (device != null ? device.deviceName : "?") + ")");
                 if (instance != null && instance.startsWith(SERVICE_INSTANCE)
                         && device != null && !device.deviceAddress.equals(myAddress)
                         && !connected && !connecting) {
                     connectTo(device.deviceAddress);
                 }
             }, null);
-            WifiP2pDnsSdServiceRequest req = WifiP2pDnsSdServiceRequest.newInstance();
-            p2p.addServiceRequest(channel, req, null);
+            if (!serviceRequestAdded) {
+                WifiP2pDnsSdServiceRequest req = WifiP2pDnsSdServiceRequest.newInstance();
+                p2p.addServiceRequest(channel, req, new WifiP2pManager.ActionListener() {
+                    @Override public void onSuccess() { serviceRequestAdded = true; }
+                    @Override public void onFailure(int r) { log("service request fail: " + reasonText(r)); }
+                });
+            }
+            // Pehle aam peer discovery se p2p ko jagao (kuch phones par service discovery tabhi chalti hai), phir service discovery
+            p2p.discoverPeers(channel, null);
             p2p.discoverServices(channel, new WifiP2pManager.ActionListener() {
-                @Override public void onSuccess() { if (!connected) setStatus("Dusra phone dhoondh raha hu… dono me app khula rakho, Wi-Fi ON rakho"); }
-                @Override public void onFailure(int r) { setStatus("Dhoondh nahi paya (code " + r + ") — Wi-Fi ON hai? Location/Nearby permission diya?"); }
+                @Override public void onSuccess() { log("search chal raha hai…"); if (!connected) setStatus("Dusra phone dhoondh raha hu… dono me app khula rakho, Wi-Fi ON rakho"); }
+                @Override public void onFailure(int r) { log("search fail: " + reasonText(r)); setStatus("Dhoondh nahi paya (" + reasonText(r) + ") — Wi-Fi ON hai? Permission diya?"); }
             });
         } catch (SecurityException e) {
+            log("permission missing");
             setStatus("Permission chahiye: Nearby devices / Location allow karo");
         }
     }
 
     private void connectTo(String address) {
         connecting = true;
+        log("judne ki koshish: " + address);
         setStatus("Dusre phone se jud raha hu… (pehli baar dusre phone par 'Accept' dabana pad sakta hai)");
         WifiP2pConfig config = new WifiP2pConfig();
         config.deviceAddress = address;
         config.wps.setup = WpsInfo.PBC;
+        config.groupOwnerIntent = 0; // client banna pasand karo, dusra owner banega to socket seedha chalega
         try {
             p2p.connect(channel, config, new WifiP2pManager.ActionListener() {
-                @Override public void onSuccess() { }
-                @Override public void onFailure(int r) { connecting = false; setStatus("Jud nahi paya (code " + r + ") — dobara try kar raha hu…"); }
+                @Override public void onSuccess() { log("connect request gaya ✓ — dusre phone par Accept karo"); }
+                @Override public void onFailure(int r) { connecting = false; log("connect fail: " + reasonText(r)); setStatus("Jud nahi paya (" + reasonText(r) + ") — dobara try kar raha hu…"); }
             });
-        } catch (SecurityException e) { connecting = false; }
+        } catch (SecurityException e) { connecting = false; log("connect permission missing"); }
     }
 
     private final WifiP2pManager.ConnectionInfoListener infoListener = new WifiP2pManager.ConnectionInfoListener() {
         @Override public void onConnectionInfoAvailable(WifiP2pInfo info) {
             if (info == null || !info.groupFormed || connected) return;
+            log(info.isGroupOwner ? "group ban gaya — mai owner hu, socket wait kar raha hu" : "group ban gaya — owner se jud raha hu");
             if (info.isGroupOwner) {
                 io.execute(() -> {
                     try (ServerSocket server = new ServerSocket(PORT)) {
@@ -435,6 +485,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             out = new DataOutputStream(s.getOutputStream());
             DataInputStream in = new DataInputStream(s.getInputStream());
             connected = true; connecting = false;
+            log("socket jud gaya ✓✓");
             setStatus("✅ Dusra phone jud gaya! Photo tap karo — magic shuru.");
             if (queuedSend != null) { Uri q = queuedSend; queuedSend = null; sendPhoto(q, true); }
             io.execute(() -> {
