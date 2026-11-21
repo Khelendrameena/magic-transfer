@@ -95,12 +95,13 @@ public class MainActivity extends Activity {
     /** Web page se mili photo ko gallery (Pictures/MagicTransfer) me save karta hai. */
     public class SaveBridge {
         @android.webkit.JavascriptInterface
-        public void saveImage(String b64) {
+        public void saveImage(String b64, String mime) {
             try {
                 byte[] bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT);
+                boolean webp = "image/webp".equals(mime);
                 android.content.ContentValues v = new android.content.ContentValues();
-                v.put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "magic_" + System.currentTimeMillis() + ".jpg");
-                v.put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                v.put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "magic_" + System.currentTimeMillis() + (webp ? ".webp" : ".jpg"));
+                v.put(android.provider.MediaStore.Images.Media.MIME_TYPE, webp ? "image/webp" : "image/jpeg");
                 if (android.os.Build.VERSION.SDK_INT >= 29) {
                     v.put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MagicTransfer");
                 }

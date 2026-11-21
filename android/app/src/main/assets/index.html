@@ -62,11 +62,12 @@
 <script src="mp/zxing-browser.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-// Optimised: ECC level L (sabse zyada jagah), har frame ~2200 chars (~1650 bytes photo data)
-// QR ki hard limit: ek QR me max ~2953 bytes — isse upar koi app nahi ja sakta.
-const CHUNK = 2200;
-const FRAME_MS = 120;
-let frames = [], frameTimer = null;
+// Optimised: ECC level L, har frame 1600 chars — itni density ki scanner har frame
+// turant pakad le (zyada ghana QR = slow scan). Frames pehle se render hoke ready
+// rehte hain, loop me sirf dikhaye jate hain — isliye render bhi fast, send bhi fast.
+const CHUNK = 1600;
+const FRAME_MS = 110;
+let frameCanvases = [], frameTimer = null;
 let recv = null;                 // {total, chunks:Map}
 let zxingControls = null;
 
@@ -82,7 +83,7 @@ async function stopCamera() {
   if (v.srcObject) { v.srcObject.getTracks().forEach(t => t.stop()); v.srcObject = null; }
 }
 
-// ---------- Photo compress (chhota = kam frame = tez) ----------
+// ---------- Photo compress (WebP = JPEG se ~30% chhota = kam frame = tez) ----------
 function compressPhoto(file) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -92,52 +93,70 @@ function compressPhoto(file) {
       const c = document.createElement("canvas");
       c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
       c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
-      let q = 0.78, url = c.toDataURL("image/jpeg", q);
-      while (url.length > 90000 && q > 0.3) { q -= 0.1; url = c.toDataURL("image/jpeg", q); }
-      resolve(url.split(",")[1]);
+      let type = "image/webp";
+      let q = 0.78, url = c.toDataURL(type, q);
+      if (!url.startsWith("data:image/webp")) { type = "image/jpeg"; url = c.toDataURL(type, q); }
+      while (url.length > 80000 && q > 0.3) { q -= 0.1; url = c.toDataURL(type, q); }
+      resolve({ b64: url.split(",")[1], mime: type });
     };
     img.onerror = reject;
     img.src = URL.createObjectURL(file);
   });
 }
 
-// ---------- SEND ----------
-function drawQR(text) {
+// ---------- SEND: saare frame PEHLE render, phir sirf dikhao (fast render) ----------
+function renderFrame(text) {
   const qr = qrcode(0, "L");           // 'L' = sabse zyada data capacity
   qr.addData(text, "Byte");
   qr.make();
-  const cv = $("qrCanvas"), ctx = cv.getContext("2d");
   const n = qr.getModuleCount(), cell = 3, size = cell * (n + 2);
-  if (cv.width !== size) { cv.width = size; cv.height = size; }
+  const cv = document.createElement("canvas");
+  cv.width = size; cv.height = size;
+  const ctx = cv.getContext("2d");
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, size, size);
   ctx.fillStyle = "#000";
   for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
     if (qr.isDark(r, c)) ctx.fillRect((c + 1) * cell, (r + 1) * cell, cell, cell);
+  return cv;
+}
+async function startSend(b64, mime) {
+  const payload = (mime === "image/webp" ? "w" : "j") + b64; // pehla akshar = photo type
+  const chunks = [];
+  for (let i = 0; i < payload.length; i += CHUNK) chunks.push(payload.substring(i, i + CHUNK));
+  // Har frame khud me total batata hai — alag header frame ki zaroorat nahi
+  const texts = chunks.map((c, i) => `MT2|${i}/${chunks.length}|${c}`);
+  frameCanvases = [];
+  setProgress(0);
+  for (let i = 0; i < texts.length; i++) {
+    frameCanvases.push(renderFrame(texts[i]));
+    setProgress((i + 1) / texts.length);
+    setStatus(`Frames taiyaar ho rahe hain… ${i + 1}/${texts.length}`);
+    if (i % 4 === 3) await new Promise(r => setTimeout(r, 0)); // UI ko saans lene do
+  }
+  setProgress(null);
+  startQRLoop();
 }
 function startQRLoop() {
-  $("qrCanvas").style.display = "block";
+  const cv = $("qrCanvas"), ctx = cv.getContext("2d");
+  cv.style.display = "block";
   $("btnStop").style.display = "block";
   let tick = 0;
-  frameTimer = setInterval(() => {
-    const idx = tick % frames.length;
-    drawQR(frames[idx]);
-    $("frameInfo").textContent = `Frame ${idx + 1} / ${frames.length}`;
+  const draw = () => {
+    const idx = tick % frameCanvases.length;
+    const src = frameCanvases[idx];
+    if (cv.width !== src.width) { cv.width = src.width; cv.height = src.height; }
+    ctx.drawImage(src, 0, 0);
+    $("frameInfo").textContent = `Frame ${idx + 1} / ${frameCanvases.length}`;
     tick++;
-  }, FRAME_MS);
+  };
+  draw();
+  frameTimer = setInterval(draw, FRAME_MS);
   setStatus("📡 QR chalu hai — dusre phone par 'Photo lo' kholo, camera is screen par rakho. Waha 100% hote hi yaha Band karo dabao.");
 }
 function stopQRLoop() {
   if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
   $("qrCanvas").style.display = "none"; $("frameInfo").textContent = "";
   $("btnStop").style.display = "none";
-}
-function startSend(b64) {
-  const chunks = [];
-  for (let i = 0; i < b64.length; i += CHUNK) chunks.push(b64.substring(i, i + CHUNK));
-  // Har frame khud me total batata hai — alag header frame ki zaroorat nahi
-  frames = chunks.map((c, i) => `MT2|${i}/${chunks.length}|${c}`);
-  setStatus(`Photo taiyaar: sirf ${chunks.length} frame. QR shuru…`);
-  startQRLoop();
 }
 
 // ---------- RECEIVE ----------
@@ -173,14 +192,16 @@ async function startReceive() {
 async function finishReceive() {
   const state = recv; recv = null;
   await stopCamera(); showCam(false); setProgress(null);
-  let b64 = "";
-  for (let i = 0; i < state.total; i++) b64 += state.chunks.get(i) || "";
+  let payload = "";
+  for (let i = 0; i < state.total; i++) payload += state.chunks.get(i) || "";
+  const mime = payload[0] === "w" ? "image/webp" : "image/jpeg";
+  const b64 = payload.slice(1);
   const img = $("photo");
-  img.src = "data:image/jpeg;base64," + b64;
+  img.src = `data:${mime};base64,` + b64;
   img.style.display = "block";
   img.classList.remove("arrive"); void img.offsetWidth; img.classList.add("arrive");
   setStatus("🎩 Photo hazir! Gallery me save kar raha hu…");
-  try { window.AndroidSave.saveImage(b64); } catch (e) {}
+  try { window.AndroidSave.saveImage(b64, mime); } catch (e) {}
 }
 
 // ---------- Wiring ----------
@@ -201,12 +222,12 @@ $("file").onchange = async e => {
   const f = e.target.files[0];
   if (!f) return;
   setStatus("Photo taiyaar kar raha hu…");
-  const b64 = await compressPhoto(f);
+  const { b64, mime } = await compressPhoto(f);
   const img = $("photo");
-  img.src = "data:image/jpeg;base64," + b64;
+  img.src = `data:${mime};base64,` + b64;
   img.style.display = "block";
   setStatus(`Photo ready (~${Math.round(b64.length * 0.75 / 1024)} KB)`);
-  startSend(b64);
+  startSend(b64, mime);
 };
 $("btnStop").onclick = () => { stopQRLoop(); setStatus("Band kar diya."); };
 </script>
