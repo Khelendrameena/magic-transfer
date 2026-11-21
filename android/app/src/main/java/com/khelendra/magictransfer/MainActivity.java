@@ -2,151 +2,473 @@ package com.khelendra.magictransfer;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.BroadcastReceiver;
+import android.content.ContentUris;
+import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.net.Uri;
+import android.net.wifi.WpsInfo;
+import android.net.wifi.p2p.WifiP2pConfig;
+import android.net.wifi.p2p.WifiP2pDevice;
+import android.net.wifi.p2p.WifiP2pInfo;
+import android.net.wifi.p2p.WifiP2pManager;
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo;
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.MediaStore;
+import android.util.Size;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.webkit.PermissionRequest;
-import android.webkit.ValueCallback;
-import android.webkit.WebChromeClient;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
-import android.widget.Button;
-import android.widget.EditText;
+import android.widget.BaseAdapter;
 import android.widget.FrameLayout;
+import android.widget.GridView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-public class MainActivity extends Activity {
-    private static final int REQ_CAMERA = 42;
-    private static final int REQ_FILE = 43;
-    private WebView webView;
-    private ValueCallback<Uri[]> fileCallback;
-    private SharedPreferences prefs;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Magic Transfer v4 — koi server nahi, koi link nahi, koi mode nahi.
+ * Dono phone me app kholo -> Wi-Fi Direct se khud jud jayenge (bahut fast).
+ * Photo tap karo -> magic animation ke saath dusre phone me chali jayegi.
+ * Dusre phone par haath phone ke upar ghumao (proximity sensor) -> animation ke saath photo hazir.
+ */
+public class MainActivity extends Activity implements SensorEventListener {
+    private static final int PORT = 8988;
+    private static final int REQ_PERMS = 7;
+    private static final String SERVICE_INSTANCE = "_magictransfer";
+    private static final String SERVICE_TYPE = "_presence._tcp";
+
+    private TextView status;
+    private GridView grid;
+    private FrameLayout overlay;
+    private ImageView overlayImg;
+    private TextView overlaySpark;
+    private TextView waitHint;
+    private GalleryAdapter adapter;
+    private final List<Uri> photos = new ArrayList<>();
+    private final ExecutorService io = Executors.newCachedThreadPool();
+    private final Handler ui = new Handler(Looper.getMainLooper());
+
+    // Wi-Fi Direct
+    private WifiP2pManager p2p;
+    private WifiP2pManager.Channel channel;
+    private BroadcastReceiver receiver;
+    private String myAddress = "";
+    private boolean connecting = false;
+    private volatile boolean connected = false;
+
+    // Socket
+    private Socket socket;
+    private DataOutputStream out;
+    private final Object writeLock = new Object();
+
+    // Receive
+    private volatile byte[] waitingPhoto = null;
+    private SensorManager sensors;
+    private Sensor proximity;
+
+    private Uri queuedSend = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        prefs = getSharedPreferences("mt", MODE_PRIVATE);
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
-        }
-        String url = prefs.getString("server", "");
-        if (url.isEmpty()) showSetup();
-        else showWeb(url);
+        buildUi();
+        requestNeededPermissions();
+        setupP2p();
+        loadGallery();
+        sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
+        if (sensors != null) proximity = sensors.getDefaultSensor(Sensor.TYPE_PROXIMITY);
     }
 
-    private void showSetup() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(48, 80, 48, 48);
+    // ---------------- UI ----------------
+    private void buildUi() {
+        FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.parseColor("#0b0b14"));
+
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        root.addView(col, new FrameLayout.LayoutParams(-1, -1));
 
         TextView title = new TextView(this);
         title.setText("✨ Magic Transfer");
         title.setTextColor(Color.WHITE);
-        title.setTextSize(24);
-        title.setGravity(Gravity.CENTER);
-        root.addView(title);
+        title.setTextSize(20);
+        title.setPadding(32, 28, 32, 4);
+        col.addView(title);
 
-        TextView hint = new TextView(this);
-        hint.setText("Apne PC par server chalao (python server.py + cloudflared tunnel) aur jo https link mile wo yaha dalo. Dono phone me yahi app + wahi link hoga — pehchan sirf haath ki hogi.");
-        hint.setTextColor(Color.parseColor("#9a9ab0"));
-        hint.setTextSize(14);
-        hint.setPadding(0, 32, 0, 32);
-        root.addView(hint);
+        status = new TextView(this);
+        status.setText("Dusra phone dhoondh raha hu… dono me app khula rakho");
+        status.setTextColor(Color.parseColor("#9a9ab0"));
+        status.setTextSize(14);
+        status.setPadding(32, 0, 32, 16);
+        col.addView(status);
 
-        final EditText input = new EditText(this);
-        input.setHint("https://xxxx.trycloudflare.com");
-        input.setTextColor(Color.WHITE);
-        input.setHintTextColor(Color.parseColor("#666680"));
-        input.setText(prefs.getString("server", ""));
-        root.addView(input);
+        grid = new GridView(this);
+        grid.setNumColumns(3);
+        grid.setHorizontalSpacing(6);
+        grid.setVerticalSpacing(6);
+        grid.setPadding(12, 4, 12, 12);
+        adapter = new GalleryAdapter();
+        grid.setAdapter(adapter);
+        grid.setOnItemClickListener((parent, view, pos, id) -> onPhotoTapped(photos.get(pos)));
+        col.addView(grid, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        Button go = new Button(this);
-        go.setText("Kholo →");
-        go.setOnClickListener(v -> {
-            String u = input.getText().toString().trim();
-            if (!u.startsWith("http")) { Toast.makeText(this, "Sahi link dalo (https://…)", Toast.LENGTH_SHORT).show(); return; }
-            prefs.edit().putString("server", u).apply();
-            showWeb(u);
-        });
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = 32;
-        root.addView(go, lp);
+        waitHint = new TextView(this);
+        waitHint.setText("✨ Ek photo aayi hai — phone ke upar haath ghumao, photo hazir hogi");
+        waitHint.setTextColor(Color.parseColor("#ffd54d"));
+        waitHint.setTextSize(15);
+        waitHint.setGravity(Gravity.CENTER);
+        waitHint.setPadding(24, 18, 24, 18);
+        waitHint.setVisibility(View.GONE);
+        waitHint.setOnClickListener(v -> reveal());
+        col.addView(waitHint);
+
+        overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(Color.parseColor("#e6000000"));
+        overlay.setVisibility(View.GONE);
+        overlayImg = new ImageView(this);
+        overlayImg.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        overlay.addView(overlayImg, new FrameLayout.LayoutParams(-1, -1));
+        overlaySpark = new TextView(this);
+        overlaySpark.setText("✨");
+        overlaySpark.setTextSize(72);
+        overlaySpark.setGravity(Gravity.CENTER);
+        overlay.addView(overlaySpark, new FrameLayout.LayoutParams(-1, -1));
+        overlay.setOnClickListener(v -> overlay.setVisibility(View.GONE));
+        root.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+
         setContentView(root);
     }
 
-    private void showWeb(String url) {
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.parseColor("#0b0b14"));
-        webView = new WebView(this);
-        root.addView(webView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    private void setStatus(String s) { ui.post(() -> status.setText(s)); }
 
-        Button gear = new Button(this);
-        gear.setText("⚙");
-        gear.setAlpha(0.75f);
-        FrameLayout.LayoutParams glp = new FrameLayout.LayoutParams(120, 120);
-        glp.gravity = Gravity.BOTTOM | Gravity.END;
-        glp.bottomMargin = 24; glp.rightMargin = 24;
-        gear.setOnClickListener(v -> { prefs.edit().remove("server").apply(); showSetup(); });
-        root.addView(gear, glp);
-        setContentView(root);
-
-        WebSettings s = webView.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setMediaPlaybackRequiresUserGesture(false);
-        s.setAllowFileAccess(true);
-        webView.setWebViewClient(new WebViewClient());
-        webView.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public void onPermissionRequest(PermissionRequest request) {
-                // Web page (MediaPipe) camera maangti hai — app ke paas permission hai to de do
-                if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                    request.grant(request.getResources());
-                } else {
-                    requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
-                    request.deny();
-                }
-            }
-
-            @Override
-            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
-                fileCallback = callback;
-                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-                i.addCategory(Intent.CATEGORY_OPENABLE);
-                i.setType("image/*");
-                startActivityForResult(Intent.createChooser(i, "Photo chuno"), REQ_FILE);
-                return true;
-            }
-        });
-        webView.loadUrl(url);
+    // ---------------- Permissions ----------------
+    private void requestNeededPermissions() {
+        List<String> need = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= 33) {
+            need.add(Manifest.permission.READ_MEDIA_IMAGES);
+            need.add(Manifest.permission.NEARBY_WIFI_DEVICES);
+        } else {
+            need.add(Manifest.permission.READ_EXTERNAL_STORAGE);
+            need.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        }
+        List<String> missing = new ArrayList<>();
+        for (String p : need) if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) missing.add(p);
+        if (!missing.isEmpty()) requestPermissions(missing.toArray(new String[0]), REQ_PERMS);
     }
 
     @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_FILE && fileCallback != null) {
-            Uri[] results = null;
-            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
-                results = new Uri[]{data.getData()};
+    public void onRequestPermissionsResult(int req, String[] perms, int[] results) {
+        if (req == REQ_PERMS) { loadGallery(); startDiscovery(); }
+    }
+
+    // ---------------- Gallery ----------------
+    private void loadGallery() {
+        io.execute(() -> {
+            List<Uri> found = new ArrayList<>();
+            String[] proj = {MediaStore.Images.Media._ID};
+            try (Cursor c = getContentResolver().query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, null, null,
+                    MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+                if (c != null) {
+                    int idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID);
+                    while (c.moveToNext() && found.size() < 90) {
+                        found.add(ContentUris.withAppendedId(
+                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(idCol)));
+                    }
+                }
+            } catch (Exception ignored) { }
+            ui.post(() -> { photos.clear(); photos.addAll(found); adapter.notifyDataSetChanged();
+                if (found.isEmpty()) setStatus("Gallery me photo nahi mile — pehle permission do, phir app dobara kholo"); });
+        });
+    }
+
+    private Bitmap thumb(Uri uri) {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                return getContentResolver().loadThumbnail(uri, new Size(320, 320), null);
             }
-            fileCallback.onReceiveValue(results);
-            fileCallback = null;
+            long id = ContentUris.parseId(uri);
+            return MediaStore.Images.Thumbnails.getThumbnail(
+                    getContentResolver(), id, MediaStore.Images.Thumbnails.MINI_KIND, null);
+        } catch (Exception e) { return null; }
+    }
+
+    private class GalleryAdapter extends BaseAdapter {
+        private final Map<Integer, Bitmap> cache = new HashMap<>();
+        @Override public int getCount() { return photos.size(); }
+        @Override public Object getItem(int i) { return photos.get(i); }
+        @Override public long getItemId(int i) { return i; }
+        @Override public View getView(int pos, View convert, ViewGroup parent) {
+            ImageView iv = convert instanceof ImageView ? (ImageView) convert : new ImageView(MainActivity.this);
+            iv.setLayoutParams(new GridView.LayoutParams(340, 340));
+            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            iv.setBackgroundColor(Color.parseColor("#1c1c2e"));
+            iv.setImageBitmap(null);
+            iv.setTag(pos);
+            Bitmap hit = cache.get(pos);
+            if (hit != null) { iv.setImageBitmap(hit); return iv; }
+            io.execute(() -> {
+                Bitmap b = thumb(photos.get(pos));
+                if (b != null) { cache.put(pos, b); ui.post(() -> {
+                    if (Integer.valueOf(pos).equals(iv.getTag())) iv.setImageBitmap(b); }); }
+            });
+            return iv;
         }
     }
 
+    // ---------------- Send ----------------
+    private void onPhotoTapped(Uri uri) {
+        if (!connected) {
+            queuedSend = uri;
+            setStatus("Abhi dusra phone nahi juda — jaise hi judega, ye photo chali jayegi. Dono phone paas rakho, dono me app khula ho.");
+            Toast.makeText(this, "Dusra phone judne ka wait ho raha hai…", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        sendPhoto(uri, true);
+    }
+
+    private void sendPhoto(Uri uri, boolean animate) {
+        io.execute(() -> {
+            try {
+                byte[] bytes;
+                try (InputStream in = getContentResolver().openInputStream(uri)) {
+                    ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                    byte[] buf = new byte[64 * 1024];
+                    int n; while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
+                    bytes = bos.toByteArray();
+                }
+                if (animate) ui.post(() -> playSendAnimation(bytes));
+                synchronized (writeLock) {
+                    out.writeUTF("PHOTO");
+                    out.writeInt(bytes.length);
+                    out.write(bytes);
+                    out.flush();
+                }
+                setStatus("✨ Photo bhej di (" + (bytes.length / 1024) + " KB) — dusre phone par haath ghumao!");
+            } catch (Exception e) {
+                setStatus("❌ Bhej nahi paya: " + e.getMessage());
+            }
+        });
+    }
+
+    private void playSendAnimation(byte[] bytes) {
+        Bitmap b = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        if (b == null) return;
+        overlayImg.setImageBitmap(b);
+        overlay.setVisibility(View.VISIBLE);
+        overlaySpark.setAlpha(0f);
+        overlayImg.setScaleX(1f); overlayImg.setScaleY(1f);
+        overlayImg.setAlpha(1f); overlayImg.setTranslationY(0f);
+        overlayImg.animate().scaleX(0.04f).scaleY(0.04f).translationY(-700f).alpha(0f)
+                .setDuration(650).withEndAction(() -> overlay.setVisibility(View.GONE)).start();
+        overlaySpark.animate().alpha(1f).scaleX(1.6f).scaleY(1.6f).setDuration(650).start();
+    }
+
+    // ---------------- Receive + hand wave ----------------
+    private void onPhotoReceived(byte[] bytes) {
+        waitingPhoto = bytes;
+        ui.post(() -> {
+            waitHint.setVisibility(View.VISIBLE);
+            waitHint.animate().alpha(0.4f).setDuration(600)
+                    .withEndAction(() -> waitHint.animate().alpha(1f).setDuration(600).start()).start();
+            setStatus("✨ Photo aa gayi hai — phone ke upar haath ghumao!");
+        });
+    }
+
     @Override
-    public void onBackPressed() {
-        if (webView != null && webView.canGoBack()) webView.goBack();
-        else super.onBackPressed();
+    public void onSensorChanged(SensorEvent event) {
+        if (event.sensor.getType() == Sensor.TYPE_PROXIMITY
+                && event.values[0] < event.sensor.getMaximumRange()
+                && waitingPhoto != null) {
+            reveal();
+        }
+    }
+    @Override public void onAccuracyChanged(Sensor s, int a) { }
+
+    private void reveal() {
+        byte[] bytes = waitingPhoto;
+        if (bytes == null) return;
+        waitingPhoto = null;
+        Bitmap b = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        ui.post(() -> {
+            waitHint.setVisibility(View.GONE);
+            if (b == null) { setStatus("Photo khul nahi payi"); return; }
+            overlayImg.setImageBitmap(b);
+            overlay.setVisibility(View.VISIBLE);
+            overlayImg.setScaleX(0.15f); overlayImg.setScaleY(0.15f);
+            overlayImg.setAlpha(0f); overlayImg.setRotation(-5f); overlayImg.setTranslationY(0f);
+            overlaySpark.setAlpha(1f); overlaySpark.setScaleX(0.5f); overlaySpark.setScaleY(0.5f);
+            overlayImg.animate().scaleX(1f).scaleY(1f).alpha(1f).rotation(0f).setDuration(550).start();
+            overlaySpark.animate().alpha(0f).scaleX(2.2f).scaleY(2.2f).setDuration(700).start();
+            setStatus("🎩 Photo hazir! Band karne ke liye photo par tap karo.");
+        });
+    }
+
+    // ---------------- Wi-Fi Direct ----------------
+    private void setupP2p() {
+        p2p = (WifiP2pManager) getSystemService(Context.WIFI_P2P_SERVICE);
+        if (p2p == null) { setStatus("Is phone me Wi-Fi Direct nahi hai"); return; }
+        channel = p2p.initialize(this, getMainLooper(), null);
+        receiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context ctx, Intent intent) {
+                String action = intent.getAction();
+                if (WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION.equals(action)) {
+                    WifiP2pDevice me = intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE);
+                    if (me != null) myAddress = me.deviceAddress;
+                } else if (WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION.equals(action)) {
+                    android.net.NetworkInfo ni = intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO);
+                    if (ni != null && ni.isConnected()) {
+                        p2p.requestConnectionInfo(channel, infoListener);
+                    } else {
+                        connected = false; connecting = false;
+                        setStatus("Connection toota — dusra phone phir dhoondh raha hu…");
+                        startDiscovery();
+                    }
+                }
+            }
+        };
+        startDiscovery();
+        ui.postDelayed(this::retryDiscoveryLoop, 20000);
+    }
+
+    private void retryDiscoveryLoop() {
+        if (!connected && !connecting) startDiscovery();
+        ui.postDelayed(this::retryDiscoveryLoop, 20000);
+    }
+
+    private void startDiscovery() {
+        if (p2p == null || channel == null) return;
+        try {
+            // Apne aap ko advertise karo taaki dusra Magic Transfer mujhe pehchan sake
+            Map<String, String> record = new HashMap<>();
+            record.put("app", "magictransfer");
+            WifiP2pDnsSdServiceInfo service = WifiP2pDnsSdServiceInfo.newInstance(SERVICE_INSTANCE, SERVICE_TYPE, record);
+            p2p.addLocalService(channel, service, null);
+            p2p.setDnsSdResponseListeners(channel, (instance, type, device) -> {
+                if (instance != null && instance.startsWith(SERVICE_INSTANCE)
+                        && device != null && !device.deviceAddress.equals(myAddress)
+                        && !connected && !connecting) {
+                    connectTo(device.deviceAddress);
+                }
+            }, null);
+            WifiP2pDnsSdServiceRequest req = WifiP2pDnsSdServiceRequest.newInstance();
+            p2p.addServiceRequest(channel, req, null);
+            p2p.discoverServices(channel, new WifiP2pManager.ActionListener() {
+                @Override public void onSuccess() { if (!connected) setStatus("Dusra phone dhoondh raha hu… dono me app khula rakho, Wi-Fi ON rakho"); }
+                @Override public void onFailure(int r) { setStatus("Dhoondh nahi paya (code " + r + ") — Wi-Fi ON hai? Location/Nearby permission diya?"); }
+            });
+        } catch (SecurityException e) {
+            setStatus("Permission chahiye: Nearby devices / Location allow karo");
+        }
+    }
+
+    private void connectTo(String address) {
+        connecting = true;
+        setStatus("Dusre phone se jud raha hu… (pehli baar dusre phone par 'Accept' dabana pad sakta hai)");
+        WifiP2pConfig config = new WifiP2pConfig();
+        config.deviceAddress = address;
+        config.wps.setup = WpsInfo.PBC;
+        try {
+            p2p.connect(channel, config, new WifiP2pManager.ActionListener() {
+                @Override public void onSuccess() { }
+                @Override public void onFailure(int r) { connecting = false; setStatus("Jud nahi paya (code " + r + ") — dobara try kar raha hu…"); }
+            });
+        } catch (SecurityException e) { connecting = false; }
+    }
+
+    private final WifiP2pManager.ConnectionInfoListener infoListener = new WifiP2pManager.ConnectionInfoListener() {
+        @Override public void onConnectionInfoAvailable(WifiP2pInfo info) {
+            if (info == null || !info.groupFormed || connected) return;
+            if (info.isGroupOwner) {
+                io.execute(() -> {
+                    try (ServerSocket server = new ServerSocket(PORT)) {
+                        Socket s = server.accept();
+                        onSocketReady(s);
+                    } catch (Exception e) { connecting = false; }
+                });
+            } else {
+                io.execute(() -> {
+                    try {
+                        Thread.sleep(1200);
+                        Socket s = new Socket();
+                        s.connect(new InetSocketAddress(info.groupOwnerAddress, PORT), 12000);
+                        onSocketReady(s);
+                    } catch (Exception e) { connecting = false; }
+                });
+            }
+        }
+    };
+
+    private void onSocketReady(Socket s) {
+        try {
+            socket = s;
+            out = new DataOutputStream(s.getOutputStream());
+            DataInputStream in = new DataInputStream(s.getInputStream());
+            connected = true; connecting = false;
+            setStatus("✅ Dusra phone jud gaya! Photo tap karo — magic shuru.");
+            if (queuedSend != null) { Uri q = queuedSend; queuedSend = null; sendPhoto(q, true); }
+            io.execute(() -> {
+                try {
+                    while (true) {
+                        String tag = in.readUTF();
+                        if ("PHOTO".equals(tag)) {
+                            int len = in.readInt();
+                            byte[] buf = new byte[len];
+                            in.readFully(buf);
+                            onPhotoReceived(buf);
+                        }
+                    }
+                } catch (Exception e) {
+                    connected = false;
+                    ui.post(() -> { setStatus("Connection band ho gaya — phir dhoondh raha hu…"); startDiscovery(); });
+                }
+            });
+        } catch (Exception e) { connecting = false; }
+    }
+
+    // ---------------- Lifecycle ----------------
+    @Override protected void onResume() {
+        super.onResume();
+        IntentFilter f = new IntentFilter();
+        f.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
+        f.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
+        if (receiver != null) registerReceiver(receiver, f);
+        if (sensors != null && proximity != null) sensors.registerListener(this, proximity, SensorManager.SENSOR_DELAY_NORMAL);
+    }
+
+    @Override protected void onPause() {
+        super.onPause();
+        try { if (receiver != null) unregisterReceiver(receiver); } catch (Exception ignored) { }
+        if (sensors != null) sensors.unregisterListener(this);
     }
 }
